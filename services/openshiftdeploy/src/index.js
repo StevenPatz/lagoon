@@ -1,9 +1,9 @@
 // @flow
 
 const sleep = require("es7-sleep");
-const { Lokka } = require('lokka');
-const { Transport } = require('lokka-transport-http');
 const { logger } = require('@amazeeio/lagoon-commons/src/local-logging');
+const { getOpenShiftInfoForSiteGroup } = require('@amazeeio/lagoon-commons/src/api');
+
 const { Jenkins } = require('jenkins');
 const { sendToAmazeeioLogs, initSendToAmazeeioLogs } = require('@amazeeio/lagoon-commons/src/logs');
 const { consumeTasks, initSendToAmazeeioTasks } = require('@amazeeio/lagoon-commons/src/tasks');
@@ -11,15 +11,9 @@ const { consumeTasks, initSendToAmazeeioTasks } = require('@amazeeio/lagoon-comm
 initSendToAmazeeioLogs();
 initSendToAmazeeioTasks();
 
-const amazeeioapihost = process.env.AMAZEEIO_API_HOST || "http://api:3000"
-
 const ocBuildDeployImageLocation = process.env.OC_BUILD_DEPLOY_IMAGE_LOCATION || "dockerhub"
 const dockerRunParam = process.env.DOCKER_RUN_PARARM || ""
 const ciOverrideImageRepo = process.env.CI_OVERRIDE_IMAGE_REPO || ""
-
-const amazeeioAPI = new Lokka({
-  transport: new Transport(`${amazeeioapihost}/graphql`)
-});
 
 const messageConsumer = async msg => {
   const {
@@ -30,19 +24,9 @@ const messageConsumer = async msg => {
 
   logger.verbose(`Received DeployOpenshift task for sitegroup: ${siteGroupName}, branch: ${branchName}, sha: ${sha}`);
 
-  const siteGroupOpenShift = await amazeeioAPI.query(`
-    {
-      siteGroup:siteGroupByName(name: "${siteGroupName}"){
-        openshift
-        client {
-          deployPrivateKey
-        }
-        gitUrl
-      }
-    }
-  `)
+  const siteGroupOpenShift = await getOpenShiftInfoForSiteGroup(siteGroupName);
 
-  let jenkinsUrl
+  let jenkinsUrl;
 
   const ocsafety = string => string.toLocaleLowerCase().replace(/[^0-9a-z-]/g,'-')
 
@@ -104,7 +88,7 @@ const messageConsumer = async msg => {
     if (process.env.AMAZEEIO_GIT_SAFE_BRANCH == "master") {
       ocBuildDeployImageName = 'amazeeio/oc-build-deploy:latest';
     } else {
-      ocBuildDeployImageName = `amazeeiodev/oc-build-deploy:latest-${process.env.AMAZEEIO_GIT_SAFE_BRANCH}`;
+      ocBuildDeployImageName = `lagoon/oc-build-deploy:${process.env.AMAZEEIO_GIT_SAFE_BRANCH}`;
     }
     ocBuildDeploystage =
     `
@@ -120,27 +104,8 @@ const messageConsumer = async msg => {
     `
       stage ('oc-build-deploy docker build') {
         sh '''
-          docker build -t ${ocBuildDeployImageName} /oc-build-deploy
+          docker build --build-arg IMAGE_REPO=${ciOverrideImageRepo} -t ${ocBuildDeployImageName} /oc-build-deploy
         '''
-      }
-    `
-  }
-
-  // If we don't have an OpenShift token, start an amazeeio/oc container which will log us in and then get the token.
-  let getTokenStage
-  if (openshiftToken == "") {
-    getTokenStage =
-    `
-      stage ('get oc token') {
-        env.OPENSHIFT_TOKEN = sh script: 'docker run --rm -e OPENSHIFT_USERNAME="${openshiftUsername}" -e OPENSHIFT_PASSWORD="${openshiftPassword}" -e OPENSHIFT_CONSOLE="${openshiftConsole}" amazeeio/oc oc whoami -t', returnStdout: true
-        env.OPENSHIFT_TOKEN = env.OPENSHIFT_TOKEN.trim()
-      }
-    `
-  } else {
-    getTokenStage =
-    `
-      stage ('get oc token') {
-        env.OPENSHIFT_TOKEN = "${openshiftToken}"
       }
     `
   }
@@ -157,8 +122,6 @@ node {
 
   ${ocBuildDeploystage}
 
-  ${getTokenStage}
-
   stage ('Deploy') {
     sh """docker run --rm \\
     ${dockerRunParam} \\
@@ -167,7 +130,9 @@ node {
     -e OPENSHIFT_CONSOLE="${openshiftConsole}" \\
     -e OPENSHIFT_REGISTRY="${openshiftRegistry}" \\
     -e APPUIO_TOKEN="${appuioToken}" \\
-    -e OPENSHIFT_TOKEN="\${env.OPENSHIFT_TOKEN}" \\
+    -e OPENSHIFT_TOKEN="${openshiftToken}" \\
+    -e OPENSHIFT_PASSWORD="${openshiftPassword}" \\
+    -e OPENSHIFT_USERNAME="${openshiftUsername}" \\
     -e OPENSHIFT_PROJECT="${openshiftProject}" \\
     -e OPENSHIFT_PROJECT_USER="${openshiftProjectUser}" \\
     -e OPENSHIFT_ROUTER_URL="${openshiftRessourceRouterUrl}" \\
@@ -183,22 +148,6 @@ node {
     -v $WORKSPACE:/git \\
     -v /var/run/docker.sock:/var/run/docker.sock \\
     ${ocBuildDeployImageName}"""
-  }
-
-  // Using openshiftVerifyDeployment which will monitor the current deployment and only continue when it is done.
-  stage ('OpenShift: deployment') {
-    env.SKIP_TLS = true
-
-    def services = sh(returnStdout: true, script: "docker run --rm -v $WORKSPACE:/git ${ocBuildDeployImageName} cat .amazeeio.services").split(',')
-    def verifyDeployments = [:]
-
-    for ( int i = 0; i &lt; services.size(); i++ ) {
-      def service = services[i]
-      verifyDeployments[service] = {
-        openshiftVerifyDeployment apiURL: "${openshiftConsole}", authToken: env.OPENSHIFT_TOKEN, depCfg: service, namespace: "${openshiftProject}", replicaCount: '', verbose: 'false', verifyReplicaCount: 'false', waitTime: '15', waitUnit: 'min', SKIP_TLS: true
-      }
-    }
-    parallel verifyDeployments
   }
 
 }`
@@ -358,5 +307,4 @@ ${error}
 Retrying deployment in ${retryExpirationSecs} secs`
   )
 }
-
 consumeTasks('deploy-openshift', messageConsumer, retryHandler, deathHandler)

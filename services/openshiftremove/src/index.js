@@ -1,12 +1,12 @@
 // @flow
 
 const sleep = require("es7-sleep");
-const { Lokka } = require('lokka');
-const { Transport } = require('lokka-transport-http');
 const { logger } = require('@amazeeio/lagoon-commons/src/local-logging');
 const { Jenkins } = require('jenkins');
 const { sendToAmazeeioLogs, initSendToAmazeeioLogs } = require('@amazeeio/lagoon-commons/src/logs');
 const { consumeTasks, initSendToAmazeeioTasks } = require('@amazeeio/lagoon-commons/src/tasks');
+
+const { getOpenShiftInfoForSiteGroup } = require('@amazeeio/lagoon-commons/src/api');
 
 initSendToAmazeeioLogs();
 initSendToAmazeeioTasks();
@@ -15,10 +15,6 @@ const amazeeioapihost = process.env.AMAZEEIO_API_HOST || "http://api:3000"
 const jenkinsurl = process.env.JENKINS_URL || "http://admin:admin@jenkins:8080"
 
 const jenkins = Jenkins({ baseUrl: `${jenkinsurl}`, promisify: true});
-
-const amazeeioAPI = new Lokka({
-  transport: new Transport(`${amazeeioapihost}/graphql`)
-});
 
 const ocsafety = string => string.toLocaleLowerCase().replace(/[^0-9a-z-]/g,'-')
 
@@ -32,13 +28,7 @@ const messageConsumer = async function(msg) {
 
   logger.verbose(`Received RemoveOpenshift task for sitegroup ${siteGroupName}, type ${type}, branch ${branch}, pullrequest ${pullrequest}`);
 
-  const siteGroupOpenShift = await amazeeioAPI.query(`
-    {
-      siteGroup:siteGroupByName(name: "${siteGroupName}"){
-        openshift
-      }
-    }
-  `)
+  const siteGroupOpenShift = await getOpenShiftInfoForSiteGroup(siteGroupName);
 
   try {
     var safeSiteGroupName = ocsafety(siteGroupName)
@@ -89,34 +79,13 @@ const messageConsumer = async function(msg) {
   </com.cloudbees.hudson.plugins.folder.Folder>
   `
 
-  // If we don't have an OpenShift token, start an amazeeio/oc container which will log us in and then get the token.
-  let getTokenStage
-  if (openshiftToken == "") {
-    getTokenStage =
-    `
-      stage ('get oc token') {
-        env.OPENSHIFT_TOKEN = sh script: 'docker run --rm -e OPENSHIFT_USERNAME="${openshiftUsername}" -e OPENSHIFT_PASSWORD="${openshiftPassword}" -e OPENSHIFT_CONSOLE="${openshiftConsole}" amazeeio/oc oc whoami -t', returnStdout: true
-        env.OPENSHIFT_TOKEN = env.OPENSHIFT_TOKEN.trim()
-      }
-    `
-  } else {
-    getTokenStage =
-    `
-      stage ('get oc token') {
-        env.OPENSHIFT_TOKEN = "${openshiftToken}"
-      }
-    `
-  }
-
   var jobdsl =
   `
   node {
 
-    ${getTokenStage}
-
     stage ('oc delete') {
       sh """
-        docker run --rm -e OPENSHIFT_CONSOLE=${openshiftConsole} -e OPENSHIFT_TOKEN="\${env.OPENSHIFT_TOKEN}" amazeeio/oc oc --insecure-skip-tls-verify delete project ${openshiftProject} || true
+        docker run --rm -e OPENSHIFT_CONSOLE=${openshiftConsole} -e OPENSHIFT_TOKEN="${openshiftToken}" -e OPENSHIFT_USERNAME="${openshiftUsername}" -e OPENSHIFT_PASSWORD="${openshiftPassword}" amazeeio/oc oc --insecure-skip-tls-verify delete project ${openshiftProject} || true
       """
     }
   }
